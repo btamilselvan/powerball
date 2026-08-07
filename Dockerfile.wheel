@@ -1,0 +1,36 @@
+# Wheel-based method: build a .whl in one stage, install it (plus the `api`
+# extra) with plain pip in a clean stage, then run.
+#
+# Build:  docker build -f Dockerfile.wheel -t powerball:wheel .
+# Run:    docker run --rm -p 8000:8000 -e POWERBALL_API_KEY=change-me powerball:wheel
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /build
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+
+RUN uv build --wheel -o dist
+
+
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /build/dist/*.whl /tmp/
+# Quoting the glob would stop pip from expanding it, but leaving it bare lets
+# the shell's own `[...]` globbing swallow the trailing `[api]` extras
+# marker. Resolve the wheel path into a variable first, then install it with
+# the extras marker appended untouched.
+RUN wheel="$(ls /tmp/*.whl)" && pip install --no-cache-dir "${wheel}[api]" && rm -rf /tmp/*.whl
+
+# The wheel only contains the `powerball` package; runtime data still needs
+# to be supplied separately. DEFAULT_DATA_PATH is `data/draws.csv` relative
+# to the process's working directory, so this just needs to sit next to
+# wherever `powerball-api` (WORKDIR /app) runs from.
+COPY data ./data
+
+EXPOSE 8000
+
+CMD ["powerball-api"]
