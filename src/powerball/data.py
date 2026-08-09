@@ -80,3 +80,33 @@ def load_draws(path: str | Path = DEFAULT_DATA_PATH) -> list[Draw]:
                 )
             )
     return draws
+
+
+def recent_draws(
+    draws: list[Draw], *, years: int | None = None, months: int | None = None
+) -> list[Draw]:
+    """Filter to draws from the last `years` or `months`, relative to the newest draw in `draws`.
+
+    Exactly one of `years`/`months` may be given; passing neither (or both)
+    raises `ValueError`. "Relative to the newest draw" (not `date.today()`) so
+    results stay reproducible for a fixed dataset regardless of when the
+    filter is run.
+
+    This exists purely for narrower descriptive slices (smaller LLM digests,
+    "how does the last year look vs all-time" curiosity) — Powerball draws
+    are independent random events, so a shorter window is not a *more
+    predictive* one. Callers that want the most statistically stable
+    frequency counts should pass neither argument and use the full history.
+    """
+    if (years is None) == (months is None):
+        raise ValueError("pass exactly one of years or months")
+    if not draws:
+        return []
+
+    newest = max(d.date for d in draws)
+    total_months = years * 12 if years is not None else months
+    cutoff_month_index = newest.year * 12 + (newest.month - 1) - total_months
+    cutoff_year, cutoff_month = divmod(cutoff_month_index, 12)
+    cutoff = date_type(cutoff_year, cutoff_month + 1, min(newest.day, 28))
+
+    return [d for d in draws if d.date > cutoff]

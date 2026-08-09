@@ -1,11 +1,22 @@
-"""Command-line entry point: `powerball pick` and `powerball stats`."""
+"""Command-line entry point: `powerball pick`, `powerball stats`, `powerball insights`."""
 
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 
-from powerball.data import DEFAULT_DATA_PATH, load_draws
+from powerball.data import DEFAULT_DATA_PATH, load_draws, recent_draws
+from powerball.insights import (
+    DEFAULT_HOST,
+    DEFAULT_MODEL,
+    HOST_ENV_VAR,
+    MODEL_ENV_VAR,
+    OllamaUnavailableError,
+    build_stats_digest,
+    generate_commentary_pick,
+    generate_insights,
+)
 from powerball.picker import quick_pick, smart_pick
 from powerball.stats import cold_numbers, hot_numbers, powerball_frequency, white_ball_frequency
 
@@ -42,6 +53,41 @@ def cmd_stats(args: argparse.Namespace) -> None:
         print(f"  {n:2d}  x{count}")
 
 
+def cmd_insights(args: argparse.Namespace) -> None:
+    draws = load_draws(args.data)
+    if args.years is not None or args.months is not None:
+        draws = recent_draws(draws, years=args.years, months=args.months)
+    digest = build_stats_digest(draws)
+
+    print(
+        f"Analyzing {digest['draw_count']} draws ({digest['date_range']['from']} to "
+        f"{digest['date_range']['to']})\n"
+    )
+
+    try:
+        insights = generate_insights(digest, model=args.model, host=args.host)
+    except OllamaUnavailableError as e:
+        print(f"error: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
+
+    print(insights.summary)
+    print()
+    for note in insights.notable_patterns:
+        print(f"- {note.headline}: {note.detail}")
+    print(f"\n{insights.disclaimer}")
+
+    if args.pick:
+        try:
+            pick = generate_commentary_pick(draws, digest, model=args.model, host=args.host)
+        except OllamaUnavailableError as e:
+            print(f"error: {e}", file=sys.stderr)
+            raise SystemExit(1) from e
+        whites = " ".join(f"{n:02d}" for n in pick.whites)
+        print(f"\nAI commentary pick: {whites}  PB {pick.powerball:02d}")
+        print(f"Rationale: {pick.rationale}")
+        print(pick.disclaimer)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="powerball", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -56,6 +102,34 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--data", default=DEFAULT_DATA_PATH, help="path to draws CSV")
     stats.add_argument("--top", type=int, default=10)
     stats.set_defaults(func=cmd_stats)
+
+    insights = subparsers.add_parser(
+        "insights",
+        help="LLM-generated commentary on historical patterns (local Ollama; novelty feature, "
+        "not a predictive edge)",
+    )
+    insights.add_argument("--data", default=DEFAULT_DATA_PATH, help="path to draws CSV")
+    window = insights.add_mutually_exclusive_group()
+    window.add_argument(
+        "--years", type=int, default=None, help="only analyze the last N years (default: all)"
+    )
+    window.add_argument(
+        "--months", type=int, default=None, help="only analyze the last N months (default: all)"
+    )
+    insights.add_argument(
+        "--pick", action="store_true", help="also generate a caveated AI commentary pick"
+    )
+    insights.add_argument(
+        "--model",
+        default=None,
+        help=f"Ollama model tag (default: ${MODEL_ENV_VAR} or {DEFAULT_MODEL})",
+    )
+    insights.add_argument(
+        "--host",
+        default=None,
+        help=f"Ollama server URL (default: ${HOST_ENV_VAR} or {DEFAULT_HOST})",
+    )
+    insights.set_defaults(func=cmd_insights)
 
     return parser
 
