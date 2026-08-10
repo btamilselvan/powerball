@@ -2,6 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from powerball.api import app
+from powerball.insights import CommentaryPickResult, Insights, PatternNote
+from powerball.llm import LLMUnavailableError
 from powerball.rules import POWERBALL_MAX, POWERBALL_MIN, WHITE_MAX, WHITE_MIN
 from powerball.security import API_KEY_ENV_VAR
 
@@ -61,3 +63,59 @@ def test_pick_count_out_of_range_is_rejected(client, monkeypatch):
     monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
     resp = client.get("/pick/quick", params={"count": 0}, headers={"X-API-Key": "correct-key"})
     assert resp.status_code == 422
+
+
+def test_insights_without_key_configured_is_unavailable(client, monkeypatch):
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    resp = client.get("/insights")
+    assert resp.status_code == 503
+
+
+def test_insights_with_correct_key_returns_commentary(client, monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
+    fake = Insights(
+        summary="s",
+        notable_patterns=[PatternNote(headline=f"h{i}", detail=f"d{i}") for i in range(3)],
+        disclaimer="disc",
+    )
+    monkeypatch.setattr("powerball.api.generate_insights", lambda digest, **kw: fake)
+    resp = client.get("/insights", headers={"X-API-Key": "correct-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["summary"] == "s"
+    assert len(body["notable_patterns"]) == 3
+
+
+def test_insights_when_llm_unavailable_returns_503(client, monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
+
+    def _raise(*args, **kwargs):
+        raise LLMUnavailableError("no ollama running")
+
+    monkeypatch.setattr("powerball.api.generate_insights", _raise)
+    resp = client.get("/insights", headers={"X-API-Key": "correct-key"})
+    assert resp.status_code == 503
+    assert "no ollama running" in resp.json()["detail"]
+
+
+def test_insights_pick_with_correct_key_returns_pick(client, monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
+    fake = CommentaryPickResult(whites=(1, 2, 3, 4, 5), powerball=6, rationale="r")
+    monkeypatch.setattr("powerball.api.generate_commentary_pick", lambda draws, digest, **kw: fake)
+    resp = client.get("/insights/pick", headers={"X-API-Key": "correct-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["whites"] == [1, 2, 3, 4, 5]
+    assert body["powerball"] == 6
+    assert "independent random events" in body["disclaimer"]
+
+
+def test_insights_pick_when_llm_unavailable_returns_503(client, monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
+
+    def _raise(*args, **kwargs):
+        raise LLMUnavailableError("model not pulled")
+
+    monkeypatch.setattr("powerball.api.generate_commentary_pick", _raise)
+    resp = client.get("/insights/pick", headers={"X-API-Key": "correct-key"})
+    assert resp.status_code == 503

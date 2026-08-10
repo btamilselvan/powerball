@@ -9,6 +9,12 @@ strategies: `quick` (uniform random) and `smart` (weighted toward numbers that h
 often in the supplied historical data). Powerball drawings are independent random events — `smart`
 is a novelty/exploration feature, not a real edge, and any UI/docs text should keep saying so.
 
+There's also an `insights` feature that uses an LLM (local Ollama by default, or an
+OpenAI-compatible endpoint — see `llm.py`) to turn the same historical stats into natural-language
+commentary, and optionally a caveated "AI commentary pick". Same rule applies: this is
+descriptive/novelty output layered on real historical data, never framed as a predictive edge. See
+`insights.py`'s module docstring for the specifics.
+
 ## Commands
 
 Dependency management and running commands both go through `uv`.
@@ -26,38 +32,86 @@ uv run powerball pick --strategy quick --count 5
 uv run powerball pick --strategy smart --count 5
 uv run powerball stats --top 10
 
+uv run powerball insights                    # LLM commentary over the full history
+uv run powerball insights --years 1          # ...over just the last year
+uv run powerball insights --pick             # ...plus a caveated AI commentary pick
+# default provider is Ollama: requires a local server (`ollama serve`) with the
+# target model pulled (`ollama pull gemma4:e4b` or whatever POWERBALL_INSIGHTS_MODEL points at)
+uv run powerball insights --provider openai  # ...or hit an OpenAI-compatible endpoint instead
+
 POWERBALL_API_KEY=some-secret uv run powerball-api      # run the HTTP API (see api.py)
 POWERBALL_API_KEY=some-secret uv run uvicorn powerball.api:app --reload  # with autoreload
 ```
 
+`insights` backend selection (`llm.py`) is `POWERBALL_INSIGHTS_PROVIDER` (`ollama`, the default, or
+`openai`), all optional and provider-scoped:
+- `ollama`: `POWERBALL_INSIGHTS_MODEL` (default `gemma4:e4b`), `OLLAMA_HOST` (default
+  `http://localhost:11434`). No API key — inference is local.
+- `openai`: `POWERBALL_INSIGHTS_MODEL` (default `gpt-4o-mini`), `POWERBALL_INSIGHTS_HOST` (default
+  `https://api.openai.com/v1` — point this at any OpenAI-compatible server), and an API key via
+  `POWERBALL_INSIGHTS_API_KEY` or `OPENAI_API_KEY` (checked in that order).
+
 ## Architecture
 
-Source lives under `src/powerball/` (src layout). Data flows one direction through four modules:
+Source lives under `src/powerball/` (src layout). Data flows one direction through these modules:
 
 - `rules.py` — the only place game constants live (white ball range/count, powerball range). Every
   other module imports from here rather than hardcoding 1-69 / 1-26 / 5, so a rules change only
   needs one edit.
-- `data.py` — `Draw` (frozen dataclass, validates itself against `rules.py` in `__post_init__`) and
+- `data.py` — `Draw` (frozen dataclass, validates itself against `rules.py` in `__post_init__`),
   `load_draws()`, which parses the CSV format (header row + rows shaped like
   `"Wed, Jan 3, 2024",4,15,29,32,36,5` — date, 5 whites, powerball, read positionally) into `Draw`
-  objects. `DEFAULT_DATA_PATH` is `data/draws.csv`, resolved relative to the process's current
-  working directory (not to this file) — `data/` isn't packaged into distributions, so a
-  `Path(__file__)`-relative default would break once the package is installed from a wheel.
-- `stats.py` — pure functions over `Iterable[Draw]` → `Counter`, plus `hot_numbers`/`cold_numbers`
-  helpers. `cold_numbers` fills in numbers with zero occurrences so they aren't silently omitted.
+  objects, and `recent_draws(draws, *, years=, months=)`, a pure filter to the last N years/months
+  relative to the newest draw in the list (not `date.today()`, so results stay reproducible). Note
+  `Draw.__post_init__` validates every row against today's `rules.py` ranges — loading data from
+  before the Oct 2015 rule change (different white-ball/powerball ranges) will raise immediately
+  rather than silently mixing incompatible eras. `DEFAULT_DATA_PATH` is `data/draws.csv`, resolved
+  relative to the process's current working directory (not to this file) — `data/` isn't packaged
+  into distributions, so a `Path(__file__)`-relative default would break once the package is
+  installed from a wheel.
+- `stats.py` — pure functions over `Iterable[Draw]` → `Counter` (or a dict/list of them):
+  frequency (`white_ball_frequency`, `powerball_frequency`, `hot_numbers`/`cold_numbers`), plus
+  pattern analysis (`pair_frequency`, `odd_even_split`, `consecutive_pair_counts`,
+  `positional_frequency`, `overdue_numbers`, `decade_distribution`, `sum_distribution`). Feeds both
+  `picker.smart_pick` (as weights) and `insights.build_stats_digest` (as LLM input). `cold_numbers`
+  and `overdue_numbers` fill in numbers with zero occurrences / max gap so they aren't silently
+  omitted.
 - `picker.py` — `quick_pick()` and `smart_pick(draws)`, both returning a `Draw`. `smart_pick` uses
   `stats.py`'s frequency counts as weights (+1 Laplace smoothing so untouched numbers stay
   possible) and falls back to effectively-uniform behavior when `draws` is empty. Both accept an
   optional `random.Random` for deterministic tests.
-- `cli.py` — argparse wiring (`pick`, `stats` subcommands) on top of the above; no logic of its own.
-- `api.py` — FastAPI app exposing `GET /health` (unauthenticated) and `GET /pick/quick` /
-  `GET /pick/smart` (both behind `security.require_api_key`, `?count=` 1-25). Draws are loaded once
-  at startup (`lifespan`) into `app.state.draws` rather than re-read per request. `/pick/smart`
-  always reads the server's own `data/draws.csv` — it deliberately does not accept a client-supplied
-  path, to avoid turning the endpoint into an arbitrary file reader.
+- `llm.py` — pluggable LLM backend, talked to directly over HTTP via `httpx` (no vendor SDKs, so no
+  `ollama` package dependency). `LLMProvider` is a one-method interface (`chat_json(system, user,
+  schema) -> str`); `OllamaProvider` (default, local, no API key) and `OpenAIProvider` (OpenAI or
+  any OpenAI-compatible `/chat/completions` server — LM Studio, vLLM, Groq, etc.) implement it.
+  `get_provider(provider=, model=, host=)` picks one based on `$POWERBALL_INSIGHTS_PROVIDER`
+  (`ollama`/`openai`, default `ollama`), falling back through each provider's own env vars — see
+  the module docstring. `LLMUnavailableError` wraps connection failures, missing-model/auth errors,
+  and unknown-provider names with an actionable message.
+- `insights.py` — LLM-generated commentary, backend-agnostic (delegates the actual model call to
+  `llm.py`). `build_stats_digest(draws)` turns `stats.py` output into a compact JSON-serializable
+  dict — the *only* thing sent to the model, never raw draw rows. `generate_insights(stats)` returns
+  a structured `Insights` (summary + notable patterns), enforced via the backend's own
+  schema-constrained decoding. `generate_commentary_pick(draws, stats)` additionally proposes a
+  ticket, validated against `rules.py` before being accepted (retries once on an invalid response,
+  then raises). Every `generate_commentary_pick` result carries a hardcoded `DISCLAIMER` regardless
+  of what the model itself says — never trust the model to include it unprompted.
+- `cli.py` — argparse wiring (`pick`, `stats`, `insights` subcommands) on top of the above; no logic
+  of its own. `insights` takes `--provider`/`--model`/`--host`, each defaulting to the matching env
+  var when omitted.
+- `api.py` — FastAPI app exposing `GET /health` (unauthenticated), `GET /pick/quick` / `GET
+  /pick/smart` / `GET /insights` / `GET /insights/pick` (all behind `security.require_api_key`;
+  `/pick/*` also take `?count=` 1-25). Draws are loaded once at startup (`lifespan`) into
+  `app.state.draws` rather than re-read per request. `/pick/smart` and `/insights*` always read the
+  server's own `data/draws.csv` — they deliberately don't accept a client-supplied path, to avoid
+  turning the endpoints into an arbitrary file reader. `/insights*` don't accept a client-supplied
+  provider/model either (env vars only) and return 503 (not 500) on `LLMUnavailableError` — a
+  down/unpulled local model or an upstream API outage is an availability problem, not a server bug.
 - `security.py` — `require_api_key`, a FastAPI dependency checking the `X-API-Key` header against
   the `POWERBALL_API_KEY` env var with `secrets.compare_digest`. Fails closed: if the env var isn't
-  set, protected endpoints return 503 rather than allowing unauthenticated access.
+  set, protected endpoints return 503 rather than allowing unauthenticated access. Only guards
+  `/pick/*` and `/insights*` — `insights.py`'s own LLM calls (via `llm.py`) need no separate key
+  when using the default local Ollama backend.
 
 `data/draws.csv` holds the historical draw data used by the CLI, tests, and API by default (see
 `data/README.md` for the row format). Pass `--data path/to/file.csv` to point the CLI at a different
