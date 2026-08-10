@@ -5,42 +5,35 @@ import pytest
 from powerball.data import load_draws
 from powerball.insights import (
     DISCLAIMER,
-    OllamaUnavailableError,
     build_stats_digest,
     generate_commentary_pick,
     generate_insights,
 )
+from powerball.llm import LLMUnavailableError
 
 
-class _FakeMessage:
-    def __init__(self, content):
-        self.content = content
-
-
-class _FakeResponse:
-    def __init__(self, content):
-        self.message = _FakeMessage(content)
-
-
-class _FakeClient:
-    """Stands in for `ollama.Client` — `chat()` returns canned responses, never hits a server.
+class _FakeProvider:
+    """Stands in for an `LLMProvider` — `chat_json()` returns canned responses.
 
     Pass one content string for a single-shot response, or several to feed a
     retry loop one response per call (the last one repeats if called beyond
     what was given).
     """
 
+    model = "fake-model"
+
     def __init__(self, *contents):
         self._contents = list(contents)
 
-    def chat(self, **kwargs):
-        content = self._contents.pop(0) if len(self._contents) > 1 else self._contents[0]
-        return _FakeResponse(content)
+    def chat_json(self, **kwargs):
+        return self._contents.pop(0) if len(self._contents) > 1 else self._contents[0]
 
 
-class _BrokenClient:
-    def chat(self, **kwargs):
-        raise ConnectionError("connection refused")
+class _BrokenProvider:
+    model = "fake-model"
+
+    def chat_json(self, **kwargs):
+        raise LLMUnavailableError("couldn't reach Ollama at http://localhost:11434")
 
 
 @pytest.fixture
@@ -69,7 +62,7 @@ def _insights_payload(n_patterns=3):
 
 def test_generate_insights_parses_response_and_stamps_disclaimer(monkeypatch, draws):
     monkeypatch.setattr(
-        "powerball.insights.ollama.Client", lambda host=None: _FakeClient(_insights_payload())
+        "powerball.insights.get_provider", lambda **kw: _FakeProvider(_insights_payload())
     )
     result = generate_insights(build_stats_digest(draws))
     assert result.summary == "test summary"
@@ -79,8 +72,8 @@ def test_generate_insights_parses_response_and_stamps_disclaimer(monkeypatch, dr
 
 
 def test_generate_insights_wraps_connection_failure(monkeypatch, draws):
-    monkeypatch.setattr("powerball.insights.ollama.Client", lambda host=None: _BrokenClient())
-    with pytest.raises(OllamaUnavailableError, match="ollama serve"):
+    monkeypatch.setattr("powerball.insights.get_provider", lambda **kw: _BrokenProvider())
+    with pytest.raises(LLMUnavailableError, match="couldn't reach"):
         generate_insights(build_stats_digest(draws))
 
 
@@ -94,8 +87,8 @@ def test_generate_insights_retries_when_patterns_are_folded_into_summary(monkeyp
     )
     well_formed = _insights_payload()
     monkeypatch.setattr(
-        "powerball.insights.ollama.Client",
-        lambda host=None: _FakeClient(degenerate, well_formed),
+        "powerball.insights.get_provider",
+        lambda **kw: _FakeProvider(degenerate, well_formed),
     )
     result = generate_insights(build_stats_digest(draws))
     assert len(result.notable_patterns) == 3
@@ -105,17 +98,15 @@ def test_generate_insights_raises_after_repeated_format_violations(monkeypatch, 
     degenerate = json.dumps(
         {"summary": "everything crammed in here " * 20, "notable_patterns": [], "disclaimer": "d"}
     )
-    monkeypatch.setattr(
-        "powerball.insights.ollama.Client", lambda host=None: _FakeClient(degenerate)
-    )
-    with pytest.raises(OllamaUnavailableError, match="didn't return well-formed insights"):
+    monkeypatch.setattr("powerball.insights.get_provider", lambda **kw: _FakeProvider(degenerate))
+    with pytest.raises(LLMUnavailableError, match="didn't return well-formed insights"):
         generate_insights(build_stats_digest(draws), max_attempts=2)
 
 
 def test_generate_commentary_pick_validates_and_returns(monkeypatch, draws):
     payload = {"whites": [5, 4, 3, 2, 1], "powerball": 10, "rationale": "r"}
     monkeypatch.setattr(
-        "powerball.insights.ollama.Client", lambda host=None: _FakeClient(json.dumps(payload))
+        "powerball.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
     )
     result = generate_commentary_pick(draws, build_stats_digest(draws))
     assert result.whites == (1, 2, 3, 4, 5)  # sorted
@@ -126,7 +117,7 @@ def test_generate_commentary_pick_validates_and_returns(monkeypatch, draws):
 def test_generate_commentary_pick_rejects_invalid_output_after_retries(monkeypatch, draws):
     payload = {"whites": [1, 1, 1, 1, 1], "powerball": 999, "rationale": "bad"}
     monkeypatch.setattr(
-        "powerball.insights.ollama.Client", lambda host=None: _FakeClient(json.dumps(payload))
+        "powerball.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
     )
-    with pytest.raises(OllamaUnavailableError, match="didn't return a valid pick"):
+    with pytest.raises(LLMUnavailableError, match="didn't return a valid pick"):
         generate_commentary_pick(draws, build_stats_digest(draws), max_attempts=2)

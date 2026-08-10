@@ -2,7 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from powerball.api import app
-from powerball.insights import CommentaryPickResult, Insights, OllamaUnavailableError, PatternNote
+from powerball.insights import CommentaryPickResult, Insights, PatternNote
+from powerball.llm import LLMUnavailableError
 from powerball.rules import POWERBALL_MAX, POWERBALL_MIN, WHITE_MAX, WHITE_MIN
 from powerball.security import API_KEY_ENV_VAR
 
@@ -85,11 +86,11 @@ def test_insights_with_correct_key_returns_commentary(client, monkeypatch):
     assert len(body["notable_patterns"]) == 3
 
 
-def test_insights_when_ollama_unavailable_returns_503(client, monkeypatch):
+def test_insights_when_llm_unavailable_returns_503(client, monkeypatch):
     monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
 
     def _raise(*args, **kwargs):
-        raise OllamaUnavailableError("no ollama running")
+        raise LLMUnavailableError("no ollama running")
 
     monkeypatch.setattr("powerball.api.generate_insights", _raise)
     resp = client.get("/insights", headers={"X-API-Key": "correct-key"})
@@ -109,11 +110,11 @@ def test_insights_pick_with_correct_key_returns_pick(client, monkeypatch):
     assert "independent random events" in body["disclaimer"]
 
 
-def test_insights_pick_when_ollama_unavailable_returns_503(client, monkeypatch):
+def test_insights_pick_when_llm_unavailable_returns_503(client, monkeypatch):
     monkeypatch.setenv(API_KEY_ENV_VAR, "correct-key")
 
     def _raise(*args, **kwargs):
-        raise OllamaUnavailableError("model not pulled")
+        raise LLMUnavailableError("model not pulled")
 
     monkeypatch.setattr("powerball.api.generate_commentary_pick", _raise)
     resp = client.get("/insights/pick", headers={"X-API-Key": "correct-key"})

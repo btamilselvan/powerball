@@ -7,15 +7,12 @@ import sys
 from collections.abc import Sequence
 
 from powerball.data import DEFAULT_DATA_PATH, load_draws, recent_draws
-from powerball.insights import (
-    DEFAULT_HOST,
-    DEFAULT_MODEL,
-    HOST_ENV_VAR,
-    MODEL_ENV_VAR,
-    OllamaUnavailableError,
-    build_stats_digest,
-    generate_commentary_pick,
-    generate_insights,
+from powerball.insights import build_stats_digest, generate_commentary_pick, generate_insights
+from powerball.llm import (
+    DEFAULT_PROVIDER,
+    PROVIDER_ENV_VAR,
+    SUPPORTED_PROVIDERS,
+    LLMUnavailableError,
 )
 from powerball.picker import quick_pick, smart_pick
 from powerball.stats import cold_numbers, hot_numbers, powerball_frequency, white_ball_frequency
@@ -65,8 +62,10 @@ def cmd_insights(args: argparse.Namespace) -> None:
     )
 
     try:
-        insights = generate_insights(digest, model=args.model, host=args.host)
-    except OllamaUnavailableError as e:
+        insights = generate_insights(
+            digest, provider=args.provider, model=args.model, host=args.host
+        )
+    except LLMUnavailableError as e:
         print(f"error: {e}", file=sys.stderr)
         raise SystemExit(1) from e
 
@@ -78,8 +77,10 @@ def cmd_insights(args: argparse.Namespace) -> None:
 
     if args.pick:
         try:
-            pick = generate_commentary_pick(draws, digest, model=args.model, host=args.host)
-        except OllamaUnavailableError as e:
+            pick = generate_commentary_pick(
+                draws, digest, provider=args.provider, model=args.model, host=args.host
+            )
+        except LLMUnavailableError as e:
             print(f"error: {e}", file=sys.stderr)
             raise SystemExit(1) from e
         whites = " ".join(f"{n:02d}" for n in pick.whites)
@@ -105,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     insights = subparsers.add_parser(
         "insights",
-        help="LLM-generated commentary on historical patterns (local Ollama; novelty feature, "
+        help="LLM-generated commentary on historical patterns (novelty feature, "
         "not a predictive edge)",
     )
     insights.add_argument("--data", default=DEFAULT_DATA_PATH, help="path to draws CSV")
@@ -120,14 +121,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--pick", action="store_true", help="also generate a caveated AI commentary pick"
     )
     insights.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDERS,
+        default=None,
+        help=f"LLM backend (default: ${PROVIDER_ENV_VAR} or {DEFAULT_PROVIDER!r})",
+    )
+    insights.add_argument(
         "--model",
         default=None,
-        help=f"Ollama model tag (default: ${MODEL_ENV_VAR} or {DEFAULT_MODEL})",
+        help="model name/tag for the selected provider "
+        "(default: that provider's own env var and built-in default)",
     )
     insights.add_argument(
         "--host",
         default=None,
-        help=f"Ollama server URL (default: ${HOST_ENV_VAR} or {DEFAULT_HOST})",
+        help="server URL for the selected provider "
+        "(default: that provider's own env var and built-in default)",
     )
     insights.set_defaults(func=cmd_insights)
 

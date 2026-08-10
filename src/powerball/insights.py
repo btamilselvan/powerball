@@ -1,13 +1,14 @@
-"""Local-LLM commentary on precomputed historical stats, via Ollama.
+"""LLM commentary on precomputed historical stats, via a pluggable backend.
 
 Two things live here:
 - `build_stats_digest`: turns raw draws into the same kind of small,
   deterministic summary a human doing `smart_pick` would eyeball — hot/cold
   numbers, sums, overdue numbers, etc. — via `powerball.stats`. This digest
   is the *only* thing sent to the model; raw draw rows never are.
-- `generate_insights` / `generate_commentary_pick`: single calls to a local
-  Ollama model that turn that digest into natural-language commentary, or
-  (for the pick variant) a set of numbers "informed by" the digest.
+- `generate_insights` / `generate_commentary_pick`: single calls to an LLM
+  (see `powerball.llm` for the backend) that turn that digest into
+  natural-language commentary, or (for the pick variant) a set of numbers
+  "informed by" the digest.
 
 Powerball drawings are independent random events. Nothing here is a
 predictive edge — see `picker.smart_pick` for the same disclaimer applied to
@@ -15,33 +16,34 @@ the non-LLM strategy this builds on. `generate_commentary_pick`'s result
 carries a hardcoded `DISCLAIMER` regardless of what the model itself says,
 so the model can't omit it.
 
-Requires a local Ollama server (`ollama serve`) with the target model pulled
-(`ollama pull <model>`) — no API key, no network egress beyond localhost.
-Structured output is enforced via Ollama's `format` parameter (a JSON
-schema, generated from the Pydantic models below), which constrains decoding
-regardless of whether the underlying model has native tool-calling support.
+The actual model call is delegated to `powerball.llm.get_provider()`, which
+picks a backend (local Ollama by default, or an OpenAI-compatible endpoint)
+based on `$POWERBALL_INSIGHTS_PROVIDER` — see that module for backend
+details and env vars. This module only cares that a provider exposes
+`chat_json(system, user, schema) -> str`.
 
-That constraint only guarantees syntactically valid JSON, not that a smaller
-model respects the schema's *intent* (e.g. it may cram every pattern into
-`Insights.summary` and leave `notable_patterns` empty). The Pydantic models
-carry real length/count constraints for exactly this reason, so a
-degenerate-but-valid response fails validation and both `generate_insights`
-and `generate_commentary_pick` reject-and-retry with a sharper prompt rather
-than silently accepting it.
+Structured output is enforced via each backend's own schema-constrained
+decoding (Ollama's `format` param / OpenAI's `response_format`), generated
+from the Pydantic models below. That only guarantees syntactically valid
+JSON, not that a smaller model respects the schema's *intent* (e.g. it may
+cram every pattern into `Insights.summary` and leave `notable_patterns`
+empty). The Pydantic models carry real length/count constraints for exactly
+this reason, so a degenerate-but-valid response fails validation and both
+`generate_insights` and `generate_commentary_pick` reject-and-retry with a
+sharper prompt rather than silently accepting it.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import statistics
 from dataclasses import dataclass, field
 
-import ollama
 from pydantic import BaseModel, Field
 
 from powerball.data import Draw
+from powerball.llm import LLMUnavailableError, get_provider
 from powerball.rules import (
     POWERBALL_MAX,
     POWERBALL_MIN,
@@ -64,12 +66,6 @@ from powerball.stats import (
 )
 
 log = logging.getLogger(__name__)
-
-MODEL_ENV_VAR = "POWERBALL_INSIGHTS_MODEL"
-DEFAULT_MODEL = "gemma4:e4b"
-
-HOST_ENV_VAR = "OLLAMA_HOST"
-DEFAULT_HOST = "http://localhost:11434"
 
 DISCLAIMER = (
     "Powerball drawings are independent random events. Past frequency has no "
@@ -101,10 +97,6 @@ multiple patterns into a single entry, and never fold pattern detail into \
 about hot/cold numbers, one about sums, one about pairs) rather than several \
 entries all repeating the same stat.
 """
-
-
-class OllamaUnavailableError(RuntimeError):
-    """Raised when the local Ollama server or model isn't reachable/available."""
 
 
 class PatternNote(BaseModel):
@@ -187,68 +179,38 @@ def build_stats_digest(draws: list[Draw]) -> dict:
     }
 
 
-def _client(host: str | None) -> ollama.Client:
-    return ollama.Client(host=host or os.environ.get(HOST_ENV_VAR, DEFAULT_HOST))
-
-
-def _resolve_model(model: str | None) -> str:
-    return model or os.environ.get(MODEL_ENV_VAR, DEFAULT_MODEL)
-
-
-def _chat_json(client: ollama.Client, *, model: str, system: str, user: str, schema: dict) -> str:
-    try:
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            format=schema,
-        )
-    except ollama.ResponseError as e:
-        if getattr(e, "status_code", None) == 404:
-            raise OllamaUnavailableError(
-                f"model '{model}' isn't pulled — run `ollama pull {model}`"
-            ) from e
-        raise OllamaUnavailableError(f"Ollama returned an error: {e}") from e
-    except Exception as e:
-        # Deliberately broad: connection-refused/DNS/timeout errors surface as
-        # different exception types depending on the installed ollama/httpx
-        # version. The goal here is a friendly, actionable CLI/API message,
-        # not fine-grained handling of a transport we don't control.
-        raise OllamaUnavailableError(
-            f"couldn't reach Ollama at the configured host — is `ollama serve` running? ({e})"
-        ) from e
-    return response.message.content
-
-
 def generate_insights(
-    stats: dict, *, model: str | None = None, host: str | None = None, max_attempts: int = 3
+    stats: dict,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    host: str | None = None,
+    max_attempts: int = 3,
 ) -> Insights:
     """Turn a `build_stats_digest` result into natural-language commentary.
 
-    Ollama's `format` schema guarantees syntactically valid JSON, but smaller
-    local models don't reliably respect a schema's *semantic* intent — e.g.
-    cramming every pattern into `summary` and leaving `notable_patterns`
+    `provider`/`model`/`host` select and configure the backend (see
+    `powerball.llm.get_provider`); all default to env vars when omitted.
+
+    Schema-constrained decoding guarantees syntactically valid JSON, but
+    smaller models don't reliably respect a schema's *semantic* intent —
+    e.g. cramming every pattern into `summary` and leaving `notable_patterns`
     empty, technically valid JSON that violates the field-length/count
     constraints on `Insights`. Those constraints make that case a Pydantic
     `ValidationError`, which is treated the same as a malformed response:
     retry with a sharper correction, up to `max_attempts` times.
 
-    Raises `OllamaUnavailableError` if no well-formed response arrives within
+    Raises `LLMUnavailableError` if no well-formed response arrives within
     the attempt budget.
     """
-    client = _client(host)
-    model = _resolve_model(model)
+    llm = get_provider(provider=provider, model=model, host=host)
     user_prompt = (
         f"Precomputed stats (JSON):\n{json.dumps(stats)}\n\nSummarize the notable patterns."
     )
 
     last_error: Exception | None = None
     for _ in range(max_attempts):
-        content = _chat_json(
-            client,
-            model=model,
+        content = llm.chat_json(
             system=SYSTEM_PROMPT,
             user=user_prompt,
             schema=Insights.model_json_schema(),
@@ -267,8 +229,8 @@ def generate_insights(
         insights.disclaimer = DISCLAIMER  # code-owned; never trust the model's own wording alone
         return insights
 
-    raise OllamaUnavailableError(
-        f"model '{model}' didn't return well-formed insights after {max_attempts} attempts: "
+    raise LLMUnavailableError(
+        f"model '{llm.model}' didn't return well-formed insights after {max_attempts} attempts: "
         f"{last_error}"
     )
 
@@ -277,6 +239,7 @@ def generate_commentary_pick(
     draws: list[Draw],
     stats: dict,
     *,
+    provider: str | None = None,
     model: str | None = None,
     host: str | None = None,
     max_attempts: int = 2,
@@ -291,12 +254,14 @@ def generate_commentary_pick(
     look at. Every result carries `DISCLAIMER` regardless of what the model
     itself says.
 
-    Raises `OllamaUnavailableError` if the model doesn't return a valid pick
+    `provider`/`model`/`host` select and configure the backend (see
+    `powerball.llm.get_provider`); all default to env vars when omitted.
+
+    Raises `LLMUnavailableError` if the model doesn't return a valid pick
     (distinct, in-range numbers) within `max_attempts` tries.
     """
     del draws  # not sent to the model; see docstring
-    client = _client(host)
-    model = _resolve_model(model)
+    llm = get_provider(provider=provider, model=model, host=host)
     user_prompt = (
         f"Precomputed stats (JSON):\n{json.dumps(stats)}\n\n"
         f"Propose {WHITE_BALL_COUNT} distinct white balls in [{WHITE_MIN}, {WHITE_MAX}] "
@@ -306,15 +271,13 @@ def generate_commentary_pick(
 
     last_error: Exception | None = None
     for _ in range(max_attempts):
-        content = _chat_json(
-            client,
-            model=model,
+        content = llm.chat_json(
             system=SYSTEM_PROMPT,
             user=user_prompt,
             schema=CommentaryPick.model_json_schema(),
         )
         try:
-            log.debug("Ollama returned pick content: %s", content)
+            log.debug("model returned pick content: %s", content)
             pick = CommentaryPick.model_validate_json(content)
             whites = tuple(sorted(pick.whites))
             _validate_pick(whites, pick.powerball)
@@ -329,8 +292,9 @@ def generate_commentary_pick(
             whites=whites, powerball=pick.powerball, rationale=pick.rationale
         )
 
-    raise OllamaUnavailableError(
-        f"model '{model}' didn't return a valid pick after {max_attempts} attempts: {last_error}"
+    raise LLMUnavailableError(
+        f"model '{llm.model}' didn't return a valid pick after {max_attempts} attempts: "
+        f"{last_error}"
     )
 
 

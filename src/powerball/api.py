@@ -7,12 +7,14 @@
   a client-supplied data path, to avoid turning the endpoint into an
   arbitrary file reader.
 - `GET /insights` — LLM-generated commentary on the same server-side
-  history, requires `X-API-Key`. Calls a local Ollama server; returns 503 if
-  Ollama or the configured model isn't reachable.
+  history, requires `X-API-Key`. Calls the configured LLM backend (local
+  Ollama by default; see `llm.py`); returns 503 if it or the configured
+  model isn't reachable.
 - `GET /insights/pick` — as above, plus a caveated AI commentary pick.
 
 See `security.py` for the auth mechanism, `insights.py` for the LLM-commentary
-implementation and its "novelty, not a predictive edge" framing.
+implementation and its "novelty, not a predictive edge" framing, and `llm.py`
+for the pluggable backend (Ollama/OpenAI-compatible) that calls run through.
 """
 
 from __future__ import annotations
@@ -26,12 +28,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from powerball.data import DEFAULT_DATA_PATH, Draw, load_draws
-from powerball.insights import (
-    OllamaUnavailableError,
-    build_stats_digest,
-    generate_commentary_pick,
-    generate_insights,
-)
+from powerball.insights import build_stats_digest, generate_commentary_pick, generate_insights
+from powerball.llm import LLMUnavailableError
 from powerball.picker import quick_pick, smart_pick
 from powerball.security import require_api_key
 
@@ -104,7 +102,7 @@ def insights() -> InsightsResponse:
     digest = build_stats_digest(app.state.draws)
     try:
         result = generate_insights(digest)
-    except OllamaUnavailableError as e:
+    except LLMUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return InsightsResponse(**result.model_dump())
 
@@ -116,7 +114,7 @@ def insights_pick() -> CommentaryPickResponse:
     log.debug("Generating commentary pick with digest: %s", digest)
     try:
         result = generate_commentary_pick(draws, digest)
-    except OllamaUnavailableError as e:
+    except LLMUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return CommentaryPickResponse(
         whites=list(result.whites),
