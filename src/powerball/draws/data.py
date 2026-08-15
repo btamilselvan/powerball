@@ -17,7 +17,7 @@ from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
 
-from powerball.rules import (
+from powerball.draws.rules import (
     POWERBALL_MAX,
     POWERBALL_MIN,
     WHITE_BALL_COUNT,

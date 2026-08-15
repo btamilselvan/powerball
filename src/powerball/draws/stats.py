@@ -11,8 +11,8 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from itertools import combinations
 
-from powerball.data import Draw
-from powerball.rules import (
+from powerball.draws.data import Draw
+from powerball.draws.rules import (
     POWERBALL_MAX,
     POWERBALL_MIN,
     WHITE_BALL_COUNT,

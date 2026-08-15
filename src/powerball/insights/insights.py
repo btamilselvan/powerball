@@ -3,10 +3,10 @@
 Two things live here:
 - `build_stats_digest`: turns raw draws into the same kind of small,
   deterministic summary a human doing `smart_pick` would eyeball — hot/cold
-  numbers, sums, overdue numbers, etc. — via `powerball.stats`. This digest
+  numbers, sums, overdue numbers, etc. — via `powerball.draws.stats`. This digest
   is the *only* thing sent to the model; raw draw rows never are.
 - `generate_insights` / `generate_commentary_pick`: single calls to an LLM
-  (see `powerball.llm` for the backend) that turn that digest into
+  (see `powerball.insights.llm` for the backend) that turn that digest into
   natural-language commentary, or (for the pick variant) a set of numbers
   "informed by" the digest.
 
@@ -16,7 +16,7 @@ the non-LLM strategy this builds on. `generate_commentary_pick`'s result
 carries a hardcoded `DISCLAIMER` regardless of what the model itself says,
 so the model can't omit it.
 
-The actual model call is delegated to `powerball.llm.get_provider()`, which
+The actual model call is delegated to `powerball.insights.llm.get_provider()`, which
 picks a backend (local Ollama by default, or an OpenAI-compatible endpoint)
 based on `$POWERBALL_INSIGHTS_PROVIDER` — see that module for backend
 details and env vars. This module only cares that a provider exposes
@@ -42,16 +42,15 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
-from powerball.data import Draw
-from powerball.llm import LLMUnavailableError, get_provider
-from powerball.rules import (
+from powerball.draws.data import Draw
+from powerball.draws.rules import (
     POWERBALL_MAX,
     POWERBALL_MIN,
     WHITE_BALL_COUNT,
     WHITE_MAX,
     WHITE_MIN,
 )
-from powerball.stats import (
+from powerball.draws.stats import (
     cold_numbers,
     consecutive_pair_counts,
     decade_distribution,
@@ -64,6 +63,7 @@ from powerball.stats import (
     sum_distribution,
     white_ball_frequency,
 )
+from powerball.insights.llm import LLMUnavailableError, get_provider
 
 log = logging.getLogger(__name__)
 
@@ -190,7 +190,7 @@ def generate_insights(
     """Turn a `build_stats_digest` result into natural-language commentary.
 
     `provider`/`model`/`host` select and configure the backend (see
-    `powerball.llm.get_provider`); all default to env vars when omitted.
+    `powerball.insights.llm.get_provider`); all default to env vars when omitted.
 
     Schema-constrained decoding guarantees syntactically valid JSON, but
     smaller models don't reliably respect a schema's *semantic* intent —
@@ -255,7 +255,7 @@ def generate_commentary_pick(
     itself says.
 
     `provider`/`model`/`host` select and configure the backend (see
-    `powerball.llm.get_provider`); all default to env vars when omitted.
+    `powerball.insights.llm.get_provider`); all default to env vars when omitted.
 
     Raises `LLMUnavailableError` if the model doesn't return a valid pick
     (distinct, in-range numbers) within `max_attempts` tries.

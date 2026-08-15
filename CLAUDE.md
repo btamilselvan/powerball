@@ -10,17 +10,23 @@ often in the supplied historical data). Powerball drawings are independent rando
 is a novelty/exploration feature, not a real edge, and any UI/docs text should keep saying so.
 
 There's also an `insights` feature that uses an LLM (local Ollama by default, or an
-OpenAI-compatible endpoint — see `llm.py`) to turn the same historical stats into natural-language
-commentary, and optionally a caveated "AI commentary pick". Same rule applies: this is
-descriptive/novelty output layered on real historical data, never framed as a predictive edge. See
-`insights.py`'s module docstring for the specifics.
+OpenAI-compatible endpoint — see `insights/llm.py`) to turn the same historical stats into
+natural-language commentary, and optionally a caveated "AI commentary pick". Same rule applies:
+this is descriptive/novelty output layered on real historical data, never framed as a predictive
+edge. See `insights/insights.py`'s module docstring for the specifics.
+
+The HTTP API additionally has user accounts (`/auth/signup`, `/auth/login`, `/auth/refresh`,
+`/auth/logout`) backed by a Postgres database (e.g. Supabase), with JWT access tokens and
+opaque, rotating refresh tokens. See `auth/db.py` and `auth/service.py`'s module docstrings, and
+`db/schema.sql` for the DDL.
 
 ## Commands
 
 Dependency management and running commands both go through `uv`.
 
 ```bash
-uv sync --extra dev          # install runtime + dev deps (pytest, ruff, fastapi, uvicorn, httpx)
+uv sync --extra dev          # install runtime + dev deps (pytest, ruff, fastapi, uvicorn, httpx,
+                              # psycopg, pyjwt, bcrypt)
 
 uv run pytest                # run all tests
 uv run pytest tests/test_stats.py::test_hot_numbers_orders_by_count_desc  # run a single test
@@ -43,17 +49,29 @@ POWERBALL_API_KEY=some-secret uv run powerball-api      # run the HTTP API (see 
 POWERBALL_API_KEY=some-secret uv run uvicorn powerball.api:app --reload  # with autoreload
 ```
 
-`insights` backend selection (`llm.py`) is `POWERBALL_INSIGHTS_PROVIDER` (`ollama`, the default, or
-`openai`), all optional and provider-scoped:
+`insights` backend selection (`insights/llm.py`) is `POWERBALL_INSIGHTS_PROVIDER` (`ollama`, the
+default, or `openai`), all optional and provider-scoped:
 - `ollama`: `POWERBALL_INSIGHTS_MODEL` (default `gemma4:e4b`), `OLLAMA_HOST` (default
   `http://localhost:11434`). No API key — inference is local.
 - `openai`: `POWERBALL_INSIGHTS_MODEL` (default `gpt-4o-mini`), `POWERBALL_INSIGHTS_HOST` (default
   `https://api.openai.com/v1` — point this at any OpenAI-compatible server), and an API key via
   `POWERBALL_INSIGHTS_API_KEY` or `OPENAI_API_KEY` (checked in that order).
 
+The `/auth/*` endpoints (`auth/db.py`, `auth/service.py`) need, all required and fail-closed
+(missing → 503, same as `POWERBALL_API_KEY`):
+- `POWERBALL_DATABASE_URL` — a Postgres connection string (Supabase's, or any Postgres). Run
+  `db/schema.sql` against it first (it assumes `app_user` already exists).
+- `POWERBALL_JWT_SECRET` — HMAC secret for signing access-token JWTs.
+- Optional: `POWERBALL_ACCESS_TOKEN_TTL_MINUTES` (default 15), `POWERBALL_REFRESH_TOKEN_TTL_DAYS`
+  (default 30).
+
 ## Architecture
 
-Source lives under `src/powerball/` (src layout). Data flows one direction through these modules:
+Source lives under `src/powerball/` (src layout), split into three feature subpackages plus a
+thin top-level API/CLI layer that wires them together. Within `draws/`, data flows one direction
+through `rules.py → data.py → stats.py → picker.py`.
+
+### `draws/` — core lottery domain
 
 - `rules.py` — the only place game constants live (white ball range/count, powerball range). Every
   other module imports from here rather than hardcoding 1-69 / 1-26 / 5, so a rules change only
@@ -80,6 +98,9 @@ Source lives under `src/powerball/` (src layout). Data flows one direction throu
   `stats.py`'s frequency counts as weights (+1 Laplace smoothing so untouched numbers stay
   possible) and falls back to effectively-uniform behavior when `draws` is empty. Both accept an
   optional `random.Random` for deterministic tests.
+
+### `insights/` — LLM-generated commentary
+
 - `llm.py` — pluggable LLM backend, talked to directly over HTTP via `httpx` (no vendor SDKs, so no
   `ollama` package dependency). `LLMProvider` is a one-method interface (`chat_json(system, user,
   schema) -> str`); `OllamaProvider` (default, local, no API key) and `OpenAIProvider` (OpenAI or
@@ -89,30 +110,59 @@ Source lives under `src/powerball/` (src layout). Data flows one direction throu
   the module docstring. `LLMUnavailableError` wraps connection failures, missing-model/auth errors,
   and unknown-provider names with an actionable message.
 - `insights.py` — LLM-generated commentary, backend-agnostic (delegates the actual model call to
-  `llm.py`). `build_stats_digest(draws)` turns `stats.py` output into a compact JSON-serializable
-  dict — the *only* thing sent to the model, never raw draw rows. `generate_insights(stats)` returns
-  a structured `Insights` (summary + notable patterns), enforced via the backend's own
-  schema-constrained decoding. `generate_commentary_pick(draws, stats)` additionally proposes a
-  ticket, validated against `rules.py` before being accepted (retries once on an invalid response,
-  then raises). Every `generate_commentary_pick` result carries a hardcoded `DISCLAIMER` regardless
-  of what the model itself says — never trust the model to include it unprompted.
-- `cli.py` — argparse wiring (`pick`, `stats`, `insights` subcommands) on top of the above; no logic
-  of its own. `insights` takes `--provider`/`--model`/`--host`, each defaulting to the matching env
-  var when omitted.
+  `llm.py`). `build_stats_digest(draws)` turns `draws/stats.py` output into a compact
+  JSON-serializable dict — the *only* thing sent to the model, never raw draw rows.
+  `generate_insights(stats)` returns a structured `Insights` (summary + notable patterns), enforced
+  via the backend's own schema-constrained decoding. `generate_commentary_pick(draws, stats)`
+  additionally proposes a ticket, validated against `draws/rules.py` before being accepted (retries
+  once on an invalid response, then raises). Every `generate_commentary_pick` result carries a
+  hardcoded `DISCLAIMER` regardless of what the model itself says — never trust the model to
+  include it unprompted.
+
+### `auth/` — user accounts and sessions
+
+- `db.py` — the only module that touches the `app_user` / `refresh_tokens` Postgres tables
+  directly (schema in `db/schema.sql`; `app_user` is assumed to pre-exist). Talks to Postgres over
+  a `psycopg` connection pool (not the `supabase-py` SDK), consistent with `insights/llm.py`'s
+  "wire protocol directly, no vendor SDK" approach. `get_pool()` reads `POWERBALL_DATABASE_URL`
+  lazily on first use and fails closed (`DatabaseUnavailableError` → 503, mapped in `api.py` the
+  same way as `LLMUnavailableError`) rather than at import time. `create_user` raises
+  `UserAlreadyExistsError` on a duplicate email. `rotate_refresh_token` does the whole
+  validate-old/revoke-old/insert-new dance in one transaction with a row lock, so two concurrent
+  `/auth/refresh` calls on the same token can't both succeed.
+- `service.py` — password hashing (bcrypt), JWT access tokens (`pyjwt`, HS256, signed with
+  `POWERBALL_JWT_SECRET`), and refresh-token generation. No SQL, no FastAPI — pure functions, kept
+  separate from `db.py` so both halves are independently testable. Refresh tokens are opaque random
+  strings (`generate_refresh_token`), not JWTs, so an individual one can be revoked server-side;
+  only a sha256 hash of the raw token is ever persisted (`hash_refresh_token`), never the raw
+  value. `AuthConfigError` (missing `POWERBALL_JWT_SECRET`) also maps to 503 in `api.py`.
+
+### Top level
+
+- `cli.py` — argparse wiring (`pick`, `stats`, `insights` subcommands) on top of `draws/` and
+  `insights/`; no logic of its own. `insights` takes `--provider`/`--model`/`--host`, each
+  defaulting to the matching env var when omitted.
 - `api.py` — FastAPI app exposing `GET /health` (unauthenticated), `GET /pick/quick` / `GET
-  /pick/smart` / `GET /insights` / `GET /insights/pick` (all behind `security.require_api_key`;
-  `/pick/*` also take `?count=` 1-25). Draws are loaded once at startup (`lifespan`) into
-  `app.state.draws` rather than re-read per request. `/pick/smart` and `/insights*` always read the
-  server's own `data/draws.csv` — they deliberately don't accept a client-supplied path, to avoid
-  turning the endpoints into an arbitrary file reader. `/insights*` don't accept a client-supplied
-  provider/model either (env vars only) and return 503 (not 500) on `LLMUnavailableError` — a
-  down/unpulled local model or an upstream API outage is an availability problem, not a server bug.
+  /pick/smart` / `GET /insights` / `GET /insights/pick`, and `POST /auth/signup` / `POST
+  /auth/login` / `POST /auth/refresh` / `POST /auth/logout` (all behind
+  `security.require_api_key`; `/pick/*` also take `?count=` 1-25). Draws are loaded once at
+  startup (`lifespan`) into `app.state.draws` rather than re-read per request. `/pick/smart` and
+  `/insights*` always read the server's own `data/draws.csv` — they deliberately don't accept a
+  client-supplied path, to avoid turning the endpoints into an arbitrary file reader. `/insights*`
+  don't accept a client-supplied provider/model either (env vars only) and return 503 (not 500) on
+  `LLMUnavailableError` — a down/unpulled local model or an upstream API outage is an availability
+  problem, not a server bug. `/auth/login` and `/auth/refresh` put issued tokens only in response
+  headers (`X-Access-Token`, `X-Refresh-Token`), never in the JSON body; `/auth/refresh` rotates
+  the refresh token on every call (old one revoked, new one issued).
 - `security.py` — `require_api_key`, a FastAPI dependency checking the `X-API-Key` header against
   the `POWERBALL_API_KEY` env var with `secrets.compare_digest`. Fails closed: if the env var isn't
-  set, protected endpoints return 503 rather than allowing unauthenticated access. Only guards
-  `/pick/*` and `/insights*` — `insights.py`'s own LLM calls (via `llm.py`) need no separate key
-  when using the default local Ollama backend.
+  set, protected endpoints return 503 rather than allowing unauthenticated access. Guards
+  `/pick/*`, `/insights*`, and all `/auth/*` — `insights/insights.py`'s own LLM calls (via
+  `insights/llm.py`) need no separate key when using the default local Ollama backend.
 
 `data/draws.csv` holds the historical draw data used by the CLI, tests, and API by default (see
 `data/README.md` for the row format). Pass `--data path/to/file.csv` to point the CLI at a different
 file; the API always uses `data/draws.csv`.
+
+`db/schema.sql` holds the DDL for the `refresh_tokens` table (plus a commented-out reference copy
+of the assumed `app_user` schema) used by `auth/db.py`.

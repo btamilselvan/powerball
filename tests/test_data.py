@@ -1,6 +1,6 @@
 import pytest
 
-from powerball.data import DEFAULT_DATA_PATH, Draw, load_draws, recent_draws
+from powerball.draws.data import DEFAULT_DATA_PATH, Draw, load_draws, recent_draws
 
 
 def test_load_draws_reads_default_data():
