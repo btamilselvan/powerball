@@ -2,14 +2,14 @@ import json
 
 import pytest
 
-from powerball.data import load_draws
-from powerball.insights import (
+from powerball.draws.data import load_draws
+from powerball.insights.insights import (
     DISCLAIMER,
     build_stats_digest,
     generate_commentary_pick,
     generate_insights,
 )
-from powerball.llm import LLMUnavailableError
+from powerball.insights.llm import LLMUnavailableError
 
 
 class _FakeProvider:
@@ -62,7 +62,7 @@ def _insights_payload(n_patterns=3):
 
 def test_generate_insights_parses_response_and_stamps_disclaimer(monkeypatch, draws):
     monkeypatch.setattr(
-        "powerball.insights.get_provider", lambda **kw: _FakeProvider(_insights_payload())
+        "powerball.insights.insights.get_provider", lambda **kw: _FakeProvider(_insights_payload())
     )
     result = generate_insights(build_stats_digest(draws))
     assert result.summary == "test summary"
@@ -72,7 +72,7 @@ def test_generate_insights_parses_response_and_stamps_disclaimer(monkeypatch, dr
 
 
 def test_generate_insights_wraps_connection_failure(monkeypatch, draws):
-    monkeypatch.setattr("powerball.insights.get_provider", lambda **kw: _BrokenProvider())
+    monkeypatch.setattr("powerball.insights.insights.get_provider", lambda **kw: _BrokenProvider())
     with pytest.raises(LLMUnavailableError, match="couldn't reach"):
         generate_insights(build_stats_digest(draws))
 
@@ -87,7 +87,7 @@ def test_generate_insights_retries_when_patterns_are_folded_into_summary(monkeyp
     )
     well_formed = _insights_payload()
     monkeypatch.setattr(
-        "powerball.insights.get_provider",
+        "powerball.insights.insights.get_provider",
         lambda **kw: _FakeProvider(degenerate, well_formed),
     )
     result = generate_insights(build_stats_digest(draws))
@@ -98,7 +98,9 @@ def test_generate_insights_raises_after_repeated_format_violations(monkeypatch, 
     degenerate = json.dumps(
         {"summary": "everything crammed in here " * 20, "notable_patterns": [], "disclaimer": "d"}
     )
-    monkeypatch.setattr("powerball.insights.get_provider", lambda **kw: _FakeProvider(degenerate))
+    monkeypatch.setattr(
+        "powerball.insights.insights.get_provider", lambda **kw: _FakeProvider(degenerate)
+    )
     with pytest.raises(LLMUnavailableError, match="didn't return well-formed insights"):
         generate_insights(build_stats_digest(draws), max_attempts=2)
 
@@ -106,7 +108,7 @@ def test_generate_insights_raises_after_repeated_format_violations(monkeypatch, 
 def test_generate_commentary_pick_validates_and_returns(monkeypatch, draws):
     payload = {"whites": [5, 4, 3, 2, 1], "powerball": 10, "rationale": "r"}
     monkeypatch.setattr(
-        "powerball.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
+        "powerball.insights.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
     )
     result = generate_commentary_pick(draws, build_stats_digest(draws))
     assert result.whites == (1, 2, 3, 4, 5)  # sorted
@@ -117,7 +119,7 @@ def test_generate_commentary_pick_validates_and_returns(monkeypatch, draws):
 def test_generate_commentary_pick_rejects_invalid_output_after_retries(monkeypatch, draws):
     payload = {"whites": [1, 1, 1, 1, 1], "powerball": 999, "rationale": "bad"}
     monkeypatch.setattr(
-        "powerball.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
+        "powerball.insights.insights.get_provider", lambda **kw: _FakeProvider(json.dumps(payload))
     )
     with pytest.raises(LLMUnavailableError, match="didn't return a valid pick"):
         generate_commentary_pick(draws, build_stats_digest(draws), max_attempts=2)

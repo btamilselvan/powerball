@@ -1,8 +1,8 @@
 from collections import Counter
 from datetime import date
 
-from powerball.data import Draw, load_draws
-from powerball.stats import (
+from powerball.draws.data import Draw, load_draws
+from powerball.draws.stats import (
     cold_numbers,
     consecutive_pair_counts,
     decade_distribution,

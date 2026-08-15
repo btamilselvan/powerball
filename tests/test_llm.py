@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from powerball.llm import (
+from powerball.insights.llm import (
     DEFAULT_PROVIDER,
     PROVIDER_ENV_VAR,
     LLMUnavailableError,
@@ -20,7 +20,7 @@ def _response(status_code, json_body, url="http://example.test/"):
 
 def test_ollama_provider_returns_message_content(monkeypatch):
     monkeypatch.setattr(
-        "powerball.llm.httpx.post",
+        "powerball.insights.llm.httpx.post",
         lambda *a, **kw: _response(200, {"message": {"content": '{"ok": true}'}}),
     )
     provider = OllamaProvider(model="m", host="http://localhost:11434")
@@ -29,7 +29,7 @@ def test_ollama_provider_returns_message_content(monkeypatch):
 
 def test_ollama_provider_wraps_missing_model_as_actionable_error(monkeypatch):
     monkeypatch.setattr(
-        "powerball.llm.httpx.post", lambda *a, **kw: _response(404, {"error": "not found"})
+        "powerball.insights.llm.httpx.post", lambda *a, **kw: _response(404, {"error": "not found"})
     )
     provider = OllamaProvider(model="ghost-model", host="http://localhost:11434")
     with pytest.raises(LLMUnavailableError, match="ollama pull ghost-model"):
@@ -40,7 +40,7 @@ def test_ollama_provider_wraps_connection_failure(monkeypatch):
     def _raise(*a, **kw):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr("powerball.llm.httpx.post", _raise)
+    monkeypatch.setattr("powerball.insights.llm.httpx.post", _raise)
     provider = OllamaProvider(model="m", host="http://localhost:11434")
     with pytest.raises(LLMUnavailableError, match="ollama serve"):
         provider.chat_json(system="s", user="u", schema={})
@@ -59,7 +59,7 @@ def test_openai_provider_requires_api_key(monkeypatch):
 def test_openai_provider_returns_message_content(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(
-        "powerball.llm.httpx.post",
+        "powerball.insights.llm.httpx.post",
         lambda *a, **kw: _response(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
     )
     provider = OpenAIProvider(model="gpt-4o-mini")
@@ -76,7 +76,7 @@ def test_openai_provider_prefers_scoped_api_key_over_openai_key(monkeypatch):
 def test_openai_provider_wraps_error_response(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(
-        "powerball.llm.httpx.post", lambda *a, **kw: _response(401, {"error": "bad key"})
+        "powerball.insights.llm.httpx.post", lambda *a, **kw: _response(401, {"error": "bad key"})
     )
     provider = OpenAIProvider(model="gpt-4o-mini")
     with pytest.raises(LLMUnavailableError, match="401"):

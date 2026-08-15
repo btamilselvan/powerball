@@ -21,6 +21,9 @@ see [Insights](#insights-pluggable-llm) below. Same caveat applies: it's
 descriptive/novelty output layered on real historical data, not a
 predictive edge.
 
+The HTTP API also has real user accounts (signup/login/refresh/logout) backed by Postgres — see
+[Auth](#auth) below.
+
 ## Install
 
 ```bash
@@ -104,12 +107,59 @@ uv run powerball-api
 | `GET /pick/smart`   | `X-API-Key` header | `?count=` (1-25, default 1); always reads `data/draws.csv` |
 | `GET /insights`     | `X-API-Key` header | LLM commentary over the full `data/draws.csv` history |
 | `GET /insights/pick`| `X-API-Key` header | as above, plus a caveated AI commentary pick |
+| `POST /auth/signup` | `X-API-Key` header | create an account; `409` if the email's taken |
+| `POST /auth/login`  | `X-API-Key` header | issues an access + refresh token (see [Auth](#auth) below) |
+| `POST /auth/refresh`| `X-API-Key` header + `X-Refresh-Token` header | rotates the refresh token, issues a new access token |
+| `POST /auth/logout` | `X-API-Key` header + `X-Refresh-Token` header | revokes the refresh token; always `204` |
 
 If `POWERBALL_API_KEY` isn't set, the protected endpoints respond `503`
 rather than allowing unauthenticated access.
 
 ```bash
 curl -H "X-API-Key: some-secret" "http://localhost:8000/pick/quick?count=3"
+```
+
+### Auth
+
+Real user accounts, backed by Postgres (e.g. a [Supabase](https://supabase.com) project — any
+Postgres works, connected to directly via `psycopg`, not the `supabase-py` SDK). Login issues a
+short-lived JWT access token plus a long-lived, rotating refresh token; both are returned **only**
+in response headers, never in the JSON body.
+
+Setup:
+
+1. Create `app_user` (columns: `user_id`, `email`, `password`, `created_on`, `deleted`) if you
+   haven't already, then run [`db/schema.sql`](db/schema.sql) to create `refresh_tokens`.
+2. Set these env vars (fail-closed like `POWERBALL_API_KEY` — missing → `503`):
+
+   | Var | Default | Purpose |
+   |---|---|---|
+   | `POWERBALL_DATABASE_URL` | *(required)* | Postgres connection string |
+   | `POWERBALL_JWT_SECRET` | *(required)* | HMAC secret for signing access tokens |
+   | `POWERBALL_ACCESS_TOKEN_TTL_MINUTES` | `15` | Access token lifetime |
+   | `POWERBALL_REFRESH_TOKEN_TTL_DAYS` | `30` | Refresh token lifetime |
+
+```bash
+# create an account
+curl -X POST http://localhost:8000/auth/signup \
+  -H "X-API-Key: some-secret" -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "correct horse battery staple"}'
+
+# log in — tokens come back as response headers
+curl -i -X POST http://localhost:8000/auth/login \
+  -H "X-API-Key: some-secret" -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "correct horse battery staple"}'
+#   X-Access-Token: eyJ...
+#   X-Refresh-Token: 9f2c...
+
+# once the access token expires, trade the refresh token for a new pair
+# (the old refresh token is revoked in the same call — it can't be reused)
+curl -i -X POST http://localhost:8000/auth/refresh \
+  -H "X-API-Key: some-secret" -H "X-Refresh-Token: 9f2c..."
+
+# log out — revokes the refresh token
+curl -X POST http://localhost:8000/auth/logout \
+  -H "X-API-Key: some-secret" -H "X-Refresh-Token: 9f2c..."
 ```
 
 ## Development

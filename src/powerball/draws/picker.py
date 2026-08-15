@@ -2,7 +2,7 @@
 
 Two strategies:
 - `quick_pick`: uniform random, same odds as an in-store quick pick.
-- `smart_pick`: weighted by historical draw frequency (via `powerball.stats`),
+- `smart_pick`: weighted by historical draw frequency (via `powerball.draws.stats`),
   as a novelty/exploration tool. Powerball drawings are independent random
   events, so no strategy changes the true odds of any single ticket — this
   exists for people who want their numbers informed by history anyway.
@@ -13,15 +13,15 @@ from __future__ import annotations
 import random
 from collections import Counter
 
-from powerball.data import Draw
-from powerball.rules import (
+from powerball.draws.data import Draw
+from powerball.draws.rules import (
     POWERBALL_MAX,
     POWERBALL_MIN,
     WHITE_BALL_COUNT,
     WHITE_MAX,
     WHITE_MIN,
 )
-from powerball.stats import powerball_frequency, white_ball_frequency
+from powerball.draws.stats import powerball_frequency, white_ball_frequency
 
 
 def quick_pick(rng: random.Random | None = None) -> Draw:
